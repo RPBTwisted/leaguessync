@@ -48,7 +48,7 @@ public class LeaguesSyncPlugin extends Plugin
     @Inject private LeaguesSyncConfig config;
 
     private static final MediaType JSON_TYPE = MediaType.parse("application/json; charset=utf-8");
-    private static final int SYNC_INTERVAL_SECONDS = 30;
+    private static final int SYNC_INTERVAL_SECONDS = 5;
     private static final String SERVER_URL = "https://api.osrsleaguetracker.com/";
 
     // Last submitted state — skip the HTTP call if nothing changed.
