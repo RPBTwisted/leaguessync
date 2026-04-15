@@ -49,6 +49,7 @@ public class LeaguesSyncPlugin extends Plugin
 
     private static final MediaType JSON_TYPE = MediaType.parse("application/json; charset=utf-8");
     private static final int SYNC_INTERVAL_SECONDS = 30;
+    private static final String SERVER_URL = "https://api.osrsleaguetracker.com/";
 
     // Last submitted state — skip the HTTP call if nothing changed.
     // Written from the OkHttp callback thread, read from the scheduler thread,
@@ -92,7 +93,7 @@ public class LeaguesSyncPlugin extends Plugin
     @Override
     protected void startUp()
     {
-        log.info("LeaguesSync started — syncing to {}", config.serverUrl());
+        log.info("LeaguesSync started — syncing to {}", SERVER_URL);
     }
 
     @Override
@@ -175,9 +176,7 @@ public class LeaguesSyncPlugin extends Plugin
         Map<String, Object> payload = new HashMap<>();
         payload.put("league_tasks", leagueTasks);
 
-        String url = config.serverUrl();
-        if (!url.endsWith("/")) url += "/";
-        url += "sync/" + username;
+        String url = SERVER_URL + "sync/" + username;
 
         final Set<Integer> snapshot = new HashSet<>(leagueTasks);
 
