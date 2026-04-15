@@ -29,8 +29,6 @@ import okhttp3.Response;
 import javax.inject.Inject;
 import java.io.IOException;
 import java.time.temporal.ChronoUnit;
-import java.util.Arrays;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
@@ -39,8 +37,8 @@ import java.util.Set;
 @Slf4j
 @PluginDescriptor(
     name = "LeaguesSync",
-    description = "Syncs your Leagues task completion to your personal task tracker",
-    tags = "leagues,sync,tasks,tracker"
+    description = "Syncs your Demonic Pacts League task completion to your personal tracker at osrsleaguetracker.com",
+    tags = "leagues,sync,tasks,tracker,demonic pacts"
 )
 public class LeaguesSyncPlugin extends Plugin
 {
@@ -57,22 +55,33 @@ public class LeaguesSyncPlugin extends Plugin
     // so the reference must be volatile.
     private volatile Set<Integer> lastTaskIds = new HashSet<>();
 
-    // ── League task ID range ─────────────────────────────────────────────────
-    // Task IDs are sequential 0–(TASK_COUNT-1), assigned by Jagex.
-    // Each maps to a VarPlayer: varpId = VARP_BASE + taskId / 32, bit = taskId % 32.
-    // LEAGUE_TASK_COMPLETED_N is stored at varp (2616 + N), confirmed via dev console:
-    //   completing task 68 (group 2, bit 4) changed LEAGUE_TASK_COMPLETED_2(2618).
-    private static final int TASK_COUNT = 1592;
-    private static final int LEAGUE_TASK_COMPLETED_VARP_BASE = 2616;
+    // ── League task VarPlayer mapping ────────────────────────────────────────
+    // Task group N (covering task IDs N*32 .. N*32+31) is stored in the VarPlayer
+    // at TASK_GROUP_VARPS[N].  The varp IDs are NOT sequential — there are two
+    // gaps in the address space where other game systems live.  Using a direct
+    // lookup table avoids reading the wrong varps and producing false positives.
+    //
+    // Source: RuneLite VarPlayer enum (LEAGUE_TASK_COMPLETED_0 … _61)
+    private static final int[] TASK_GROUP_VARPS = {
+        // Groups 0–15  (tasks 0–511)      varps 2616–2631
+        2616, 2617, 2618, 2619, 2620, 2621, 2622, 2623,
+        2624, 2625, 2626, 2627, 2628, 2629, 2630, 2631,
+        // ── gap: 2632–2807 used by other game systems ──
+        // Groups 16–43 (tasks 512–1407)   varps 2808–2835
+        2808, 2809, 2810, 2811, 2812, 2813, 2814, 2815,
+        2816, 2817, 2818, 2819, 2820, 2821, 2822, 2823,
+        2824, 2825, 2826, 2827, 2828, 2829, 2830, 2831,
+        2832, 2833, 2834, 2835,
+        // ── gap: 2836–3338 used by other game systems ──
+        // Groups 44–47 (tasks 1408–1535)  varps 3339–3342
+        3339, 3340, 3341, 3342,
+        // ── gap: 3343–4035 used by other game systems ──
+        // Groups 48–61 (tasks 1536–1983)  varps 4036–4049
+        4036, 4037, 4038, 4039, 4040, 4041, 4042, 4043,
+        4044, 4045, 4046, 4047, 4048, 4049,
+    };
 
-    // Varp offsets (relative to VARP_BASE) that are NOT league-task storage —
-    // they belong to other game systems and return non-zero data that would
-    // otherwise produce false positives.  Confirmed empirically:
-    //   offset 16 (varp 2632) — bits 0,1 set  → tasks 512,513 falsely flagged
-    //   offset 31 (varp 2647) — bits 6,16 set → tasks 998,1008 falsely flagged
-    // Fully-set varps (value == -1) are caught separately in the read loop.
-    private static final Set<Integer> EXCLUDED_VARP_OFFSETS =
-        Collections.unmodifiableSet(new HashSet<>(Arrays.asList(16, 31)));
+    private static final int TASK_COUNT = TASK_GROUP_VARPS.length * 32; // 1984
 
     @Provides
     LeaguesSyncConfig provideConfig(ConfigManager configManager)
@@ -132,27 +141,20 @@ public class LeaguesSyncPlugin extends Plugin
     /**
      * Reads completed league task IDs from the game client.
      *
-     * League tasks are stored as bits packed into VarPlayers:
-     *   varpId = LEAGUE_TASK_COMPLETED_VARP_BASE + taskId / 32
-     *   bit    = taskId % 32
-     *   complete = (client.getVarpValue(varpId) & (1 << bit)) != 0
-     *
-     * Varps that return -1 (all 32 bits set) are not league-task varps — they contain
-     * data from other game systems and must be skipped to avoid false positives.
+     * Each task group N maps to TASK_GROUP_VARPS[N].  Within that VarPlayer,
+     * bit (taskId % 32) indicates whether the task is complete.
      */
     private Set<Integer> readLeagueTasks()
     {
         Set<Integer> completed = new HashSet<>();
         for (int taskId = 0; taskId < TASK_COUNT; taskId++)
         {
-            int varpOffset = taskId / 32;
-            if (EXCLUDED_VARP_OFFSETS.contains(varpOffset)) continue;
-            int varpId = LEAGUE_TASK_COMPLETED_VARP_BASE + varpOffset;
+            int group  = taskId / 32;
+            int varpId = TASK_GROUP_VARPS[group];
             int bit    = taskId % 32;
             try
             {
                 int varpValue = client.getVarpValue(varpId);
-                if (varpValue == -1) continue;  // not a league-task varp
                 if ((varpValue & (1 << bit)) != 0)
                 {
                     completed.add(taskId);
