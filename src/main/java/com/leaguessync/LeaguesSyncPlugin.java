@@ -29,6 +29,8 @@ import okhttp3.Response;
 import javax.inject.Inject;
 import java.io.IOException;
 import java.time.temporal.ChronoUnit;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
@@ -50,13 +52,27 @@ public class LeaguesSyncPlugin extends Plugin
     private static final MediaType JSON_TYPE = MediaType.parse("application/json; charset=utf-8");
     private static final int SYNC_INTERVAL_SECONDS = 30;
 
-    // Last submitted state — skip the HTTP call if nothing changed
-    private Set<Integer> lastTaskIds = new HashSet<>();
+    // Last submitted state — skip the HTTP call if nothing changed.
+    // Written from the OkHttp callback thread, read from the scheduler thread,
+    // so the reference must be volatile.
+    private volatile Set<Integer> lastTaskIds = new HashSet<>();
 
     // ── League task ID range ─────────────────────────────────────────────────
     // Task IDs are sequential 0–(TASK_COUNT-1), assigned by Jagex.
-    // Each maps to a varbit: varpId = taskId / 32, bit = taskId % 32.
+    // Each maps to a VarPlayer: varpId = VARP_BASE + taskId / 32, bit = taskId % 32.
+    // LEAGUE_TASK_COMPLETED_N is stored at varp (2616 + N), confirmed via dev console:
+    //   completing task 68 (group 2, bit 4) changed LEAGUE_TASK_COMPLETED_2(2618).
     private static final int TASK_COUNT = 1592;
+    private static final int LEAGUE_TASK_COMPLETED_VARP_BASE = 2616;
+
+    // Varp offsets (relative to VARP_BASE) that are NOT league-task storage —
+    // they belong to other game systems and return non-zero data that would
+    // otherwise produce false positives.  Confirmed empirically:
+    //   offset 16 (varp 2632) — bits 0,1 set  → tasks 512,513 falsely flagged
+    //   offset 31 (varp 2647) — bits 6,16 set → tasks 998,1008 falsely flagged
+    // Fully-set varps (value == -1) are caught separately in the read loop.
+    private static final Set<Integer> EXCLUDED_VARP_OFFSETS =
+        Collections.unmodifiableSet(new HashSet<>(Arrays.asList(16, 31)));
 
     @Provides
     LeaguesSyncConfig provideConfig(ConfigManager configManager)
@@ -117,20 +133,26 @@ public class LeaguesSyncPlugin extends Plugin
      * Reads completed league task IDs from the game client.
      *
      * League tasks are stored as bits packed into VarPlayers:
-     *   varpId = taskId / 32
+     *   varpId = LEAGUE_TASK_COMPLETED_VARP_BASE + taskId / 32
      *   bit    = taskId % 32
      *   complete = (client.getVarpValue(varpId) & (1 << bit)) != 0
+     *
+     * Varps that return -1 (all 32 bits set) are not league-task varps — they contain
+     * data from other game systems and must be skipped to avoid false positives.
      */
     private Set<Integer> readLeagueTasks()
     {
         Set<Integer> completed = new HashSet<>();
         for (int taskId = 0; taskId < TASK_COUNT; taskId++)
         {
-            int varpId = taskId / 32;
+            int varpOffset = taskId / 32;
+            if (EXCLUDED_VARP_OFFSETS.contains(varpOffset)) continue;
+            int varpId = LEAGUE_TASK_COMPLETED_VARP_BASE + varpOffset;
             int bit    = taskId % 32;
             try
             {
                 int varpValue = client.getVarpValue(varpId);
+                if (varpValue == -1) continue;  // not a league-task varp
                 if ((varpValue & (1 << bit)) != 0)
                 {
                     completed.add(taskId);
