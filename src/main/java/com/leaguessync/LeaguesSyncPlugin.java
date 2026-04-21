@@ -12,6 +12,10 @@ import com.google.inject.Provides;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
+import net.runelite.api.Quest;
+import net.runelite.api.QuestState;
+import net.runelite.api.Skill;
+import net.runelite.api.WorldType;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
@@ -51,10 +55,9 @@ public class LeaguesSyncPlugin extends Plugin
     private static final int SYNC_INTERVAL_SECONDS = 5;
     private static final String SERVER_URL = "https://api.osrsleaguetracker.com/";
 
-    // Last submitted state — skip the HTTP call if nothing changed.
-    // Written from the OkHttp callback thread, read from the scheduler thread,
-    // so the reference must be volatile.
-    private volatile Set<Integer> lastTaskIds = new HashSet<>();
+    private volatile Set<Integer>        lastTaskIds     = new HashSet<>();
+    private volatile Map<String, Integer> lastSkillLevels = new HashMap<>();
+    private volatile Map<String, String>  lastQuestStates = new HashMap<>();
 
     // ── League task VarPlayer mapping ────────────────────────────────────────
     // Task group N (covering task IDs N*32 .. N*32+31) is stored in the VarPlayer
@@ -100,6 +103,8 @@ public class LeaguesSyncPlugin extends Plugin
     protected void shutDown()
     {
         lastTaskIds.clear();
+        lastSkillLevels.clear();
+        lastQuestStates.clear();
         log.info("LeaguesSync stopped.");
     }
 
@@ -111,8 +116,9 @@ public class LeaguesSyncPlugin extends Plugin
             case HOPPING:
             case LOGGING_IN:
             case LOGIN_SCREEN:
-                // Clear cached state on profile switch so we re-submit on next login
                 lastTaskIds.clear();
+                lastSkillLevels.clear();
+                lastQuestStates.clear();
                 break;
             default:
                 break;
@@ -124,27 +130,25 @@ public class LeaguesSyncPlugin extends Plugin
     @Schedule(period = SYNC_INTERVAL_SECONDS, unit = ChronoUnit.SECONDS)
     public void scheduledSync()
     {
-        if (!config.syncEnabled())                       return;
-        if (client.getGameState() != GameState.LOGGED_IN) return;
-        if (client.getLocalPlayer() == null)             return;
+        if (!config.syncEnabled())                                      return;
+        if (client.getGameState() != GameState.LOGGED_IN)              return;
+        if (client.getLocalPlayer() == null)                           return;
+        if (!client.getWorldType().contains(WorldType.SEASONAL))       return;
 
         String username = client.getLocalPlayer().getName();
 
-        Set<Integer> completedTasks = readLeagueTasks();
-        if (!completedTasks.equals(lastTaskIds))
+        Set<Integer>         tasks  = readLeagueTasks();
+        Map<String, Integer> skills = readSkillLevels();
+        Map<String, String>  quests = readQuestStates();
+
+        if (!tasks.equals(lastTaskIds) || !skills.equals(lastSkillLevels) || !quests.equals(lastQuestStates))
         {
-            submitSync(username, completedTasks);
+            submitSync(username, tasks, skills, quests);
         }
     }
 
     // ── Reading game data ────────────────────────────────────────────────────
 
-    /**
-     * Reads completed league task IDs from the game client.
-     *
-     * Each task group N maps to TASK_GROUP_VARPS[N].  Within that VarPlayer,
-     * bit (taskId % 32) indicates whether the task is complete.
-     */
     private Set<Integer> readLeagueTasks()
     {
         Set<Integer> completed = new HashSet<>();
@@ -155,11 +159,8 @@ public class LeaguesSyncPlugin extends Plugin
             int bit    = taskId % 32;
             try
             {
-                int varpValue = client.getVarpValue(varpId);
-                if ((varpValue & (1 << bit)) != 0)
-                {
+                if ((client.getVarpValue(varpId) & (1 << bit)) != 0)
                     completed.add(taskId);
-                }
             }
             catch (ArrayIndexOutOfBoundsException e)
             {
@@ -169,16 +170,42 @@ public class LeaguesSyncPlugin extends Plugin
         return completed;
     }
 
+    private Map<String, Integer> readSkillLevels()
+    {
+        Map<String, Integer> levels = new HashMap<>();
+        for (Skill skill : Skill.values())
+        {
+            if (skill == Skill.OVERALL) continue;
+            levels.put(skill.getName(), client.getRealSkillLevel(skill));
+        }
+        return levels;
+    }
+
+    private Map<String, String> readQuestStates()
+    {
+        Map<String, String> states = new HashMap<>();
+        for (Quest quest : Quest.values())
+        {
+            states.put(quest.getName(), quest.getState(client).name());
+        }
+        return states;
+    }
+
     // ── HTTP submission ──────────────────────────────────────────────────────
 
-    private void submitSync(String username, Set<Integer> leagueTasks)
+    private void submitSync(String username, Set<Integer> leagueTasks,
+                            Map<String, Integer> skillLevels, Map<String, String> questStates)
     {
         Map<String, Object> payload = new HashMap<>();
-        payload.put("league_tasks", leagueTasks);
+        payload.put("league_tasks",  leagueTasks);
+        payload.put("skill_levels",  skillLevels);
+        payload.put("quest_states",  questStates);
 
         String url = SERVER_URL + "sync/" + username;
 
-        final Set<Integer> snapshot = new HashSet<>(leagueTasks);
+        final Set<Integer>         taskSnapshot  = new HashSet<>(leagueTasks);
+        final Map<String, Integer> skillSnapshot = new HashMap<>(skillLevels);
+        final Map<String, String>  questSnapshot = new HashMap<>(questStates);
 
         Request request = new Request.Builder()
             .url(url)
@@ -202,7 +229,9 @@ public class LeaguesSyncPlugin extends Plugin
                 {
                     if (response.isSuccessful())
                     {
-                        lastTaskIds = snapshot;
+                        lastTaskIds     = taskSnapshot;
+                        lastSkillLevels = skillSnapshot;
+                        lastQuestStates = questSnapshot;
                         log.debug("LeaguesSync: synced {} OK", username);
                     }
                     else
